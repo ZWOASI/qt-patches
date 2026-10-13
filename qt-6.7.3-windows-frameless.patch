@@ -1,0 +1,328 @@
+diff --git a/qtbase/src/plugins/platforms/windows/qwindowscontext.cpp b/qtbase/src/plugins/platforms/windows/qwindowscontext.cpp
+index d7a7b373102c5b5edeeef2dcbc40b73427a54cfe..4613e3904fe9f3d45538899c761e217c28193c5f 100644
+--- a/qtbase/src/plugins/platforms/windows/qwindowscontext.cpp
++++ b/qtbase/src/plugins/platforms/windows/qwindowscontext.cpp
+@@ -1139,7 +1139,9 @@ bool QWindowsContext::windowsProc(HWND hwnd, UINT message,
+                 }
+             return false;
+         case QtWindows::CalculateSize:
+-            return QWindowsGeometryHint::handleCalculateSize(d->m_creationContext->customMargins, msg, result);
++            return QWindowsGeometryHint::handleCalculateSize(
++                    d->m_creationContext->window->flags().testFlag(Qt::FramelessWindowHint),
++                    d->m_creationContext->customMargins, msg, result);
+         case QtWindows::GeometryChangingEvent:
+             return QWindowsWindow::handleGeometryChangingMessage(&msg, d->m_creationContext->window,
+                                                                  d->m_creationContext->margins + d->m_creationContext->customMargins);
+@@ -1204,7 +1206,8 @@ bool QWindowsContext::windowsProc(HWND hwnd, UINT message,
+         platformWindow->getSizeHints(reinterpret_cast<MINMAXINFO *>(lParam));
+         return true;// maybe available on some SDKs revisit WM_NCCALCSIZE
+     case QtWindows::CalculateSize:
+-        return QWindowsGeometryHint::handleCalculateSize(platformWindow->customMargins(), msg, result);
++        return QWindowsGeometryHint::handleCalculateSize(platformWindow->isFrameless(),
++                                                        platformWindow->customMargins(), msg, result);
+     case QtWindows::NonClientHitTest:
+         return platformWindow->handleNonClientHitTest(QPoint(msg.pt.x, msg.pt.y), result);
+     case QtWindows::GeometryChangingEvent:
+diff --git a/qtbase/src/plugins/platforms/windows/qwindowswindow.cpp b/qtbase/src/plugins/platforms/windows/qwindowswindow.cpp
+index 68a741fd93580e52242c793cc371f48eca85567a..a58133b2764b55fc7aa8a55c8da2db246650742c 100644
+--- a/qtbase/src/plugins/platforms/windows/qwindowswindow.cpp
++++ b/qtbase/src/plugins/platforms/windows/qwindowswindow.cpp
+@@ -38,6 +38,7 @@
+ #include <QtCore/qoperatingsystemversion.h>
+ 
+ #include <dwmapi.h>
++#include <shellapi.h>
+ 
+ #if QT_CONFIG(vulkan)
+ #include "qwindowsvulkaninstance.h"
+@@ -528,6 +529,75 @@ static inline void updateGLWindowSettings(const QWindow *w, HWND hwnd, Qt::Windo
+            + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+ }
+ 
++static bool hasFramelessNativeFrame(bool bFrameless, DWORD nStyle)
++{
++    return bFrameless && !(nStyle & WS_CHILD)
++            && (nStyle & (WS_CAPTION | WS_THICKFRAME)) == (WS_CAPTION | WS_THICKFRAME);
++}
++
++static QMargins framelessMaximizedMargins(UINT nDpi)
++{
++    const int nBorderX = getResizeBorderThickness(nDpi);
++    const int nBorderY = GetSystemMetricsForDpi(SM_CYSIZEFRAME, nDpi)
++            + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, nDpi);
++    return QMargins(nBorderX, nBorderY, nBorderX, nBorderY);
++}
++
++static void updateFramelessFrame(HWND hWnd, bool bEnabled)
++{
++    // 客户区覆盖整个窗口后，保留 DWM 阴影；退出无边框或进入全屏时撤销扩展。
++    const int nExtent = bEnabled ? 1 : 0;
++    const MARGINS margins = {nExtent, nExtent, nExtent, nExtent};
++    DwmExtendFrameIntoClientArea(hWnd, &margins);
++}
++
++static void adjustFramelessMaximizedClientRect(HWND hWnd, RECT *pClientRect)
++{
++    // 最大化的外框会超出工作区，先去掉不可见的缩放边框，不扣除标题栏高度。
++    const QMargins margins = framelessMaximizedMargins(GetDpiForWindow(hWnd));
++    const HMONITOR hMonitor = MonitorFromRect(pClientRect, MONITOR_DEFAULTTONEAREST);
++    pClientRect->left += margins.left();
++    pClientRect->top += margins.top();
++    pClientRect->right -= margins.right();
++    pClientRect->bottom -= margins.bottom();
++
++    MONITORINFO monitorInfo = {};
++    monitorInfo.cbSize = sizeof(monitorInfo);
++    if (!GetMonitorInfo(hMonitor, &monitorInfo))
++        return;
++
++    pClientRect->left = qMax(pClientRect->left, monitorInfo.rcWork.left);
++    pClientRect->top = qMax(pClientRect->top, monitorInfo.rcWork.top);
++    pClientRect->right = qMin(pClientRect->right, monitorInfo.rcWork.right);
++    pClientRect->bottom = qMin(pClientRect->bottom, monitorInfo.rcWork.bottom);
++
++    // 只在最大化时为自动隐藏任务栏保留触发边，真正的全屏仍覆盖整个显示器。
++    const UINT arrEdges[] = {ABE_LEFT, ABE_TOP, ABE_RIGHT, ABE_BOTTOM};
++    for (const UINT nEdge : arrEdges) {
++        APPBARDATA appBarData = {};
++        appBarData.cbSize = sizeof(appBarData);
++        appBarData.uEdge = nEdge;
++        appBarData.rc = monitorInfo.rcMonitor;
++        if (!SHAppBarMessage(ABM_GETAUTOHIDEBAREX, &appBarData))
++            continue;
++        constexpr int nTriggerWidth = 2;
++        switch (nEdge) {
++        case ABE_LEFT:
++            pClientRect->left = qMax(pClientRect->left, monitorInfo.rcMonitor.left + nTriggerWidth);
++            break;
++        case ABE_TOP:
++            pClientRect->top = qMax(pClientRect->top, monitorInfo.rcMonitor.top + nTriggerWidth);
++            break;
++        case ABE_RIGHT:
++            pClientRect->right = qMin(pClientRect->right, monitorInfo.rcMonitor.right - nTriggerWidth);
++            break;
++        case ABE_BOTTOM:
++            pClientRect->bottom = qMin(pClientRect->bottom, monitorInfo.rcMonitor.bottom - nTriggerWidth);
++            break;
++        }
++    }
++}
++
+ /*!
+     Calculates the dimensions of the invisible borders within the
+     window frames which only exist on Windows 10 and onwards.
+@@ -627,7 +697,8 @@ static inline void fixTopLevelWindowFlags(Qt::WindowFlags &flags)
+ {
+     // Not supported on Windows, also do correction when it is set.
+     flags &= ~Qt::WindowFullscreenButtonHint;
+-    switch (flags) {
++    // 仅设置窗口类型和无边框标志时，仍提供该类型默认的系统窗口操作。
++    switch (flags & ~Qt::FramelessWindowHint) {
+     case Qt::Window:
+         flags |= Qt::WindowTitleHint | Qt::WindowSystemMenuHint | Qt::WindowMinimizeButtonHint
+               |Qt::WindowMaximizeButtonHint|Qt::WindowCloseButtonHint;
+@@ -811,6 +882,9 @@ void WindowCreationData::fromWindow(const QWindow *w, const Qt::WindowFlags flag
+                 }
+                 if (flags & Qt::WindowTitleHint)
+                     style |= WS_CAPTION; // Contains WS_DLGFRAME
++            } else if (!popup && type != Qt::ToolTip && type != Qt::SplashScreen) {
++                // 保留原生缩放和状态切换能力，实际边框和标题栏由 NCCALCSIZE 移除。
++                style |= WS_CAPTION | WS_THICKFRAME;
+             }
+             if (flags & Qt::WindowSystemMenuHint)
+                 style |= WS_SYSMENU;
+@@ -995,6 +1069,8 @@ void WindowCreationData::initialize(const QWindow *w, HWND hwnd, bool frameChang
+                 EnableMenuItem(systemMenu, SC_CLOSE, MF_BYCOMMAND|MF_GRAYED);
+         }
+         updateGLWindowSettings(w, hwnd, flags, opacityLevel);
++        if (hasFramelessNativeFrame(flags.testFlag(Qt::FramelessWindowHint), style))
++            updateFramelessFrame(hwnd, true);
+     } else { // child.
+         SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, swpFlags);
+     }
+@@ -1045,6 +1121,8 @@ QMargins QWindowsGeometryHint::frameOnPrimaryScreen(const QWindow *w, DWORD styl
+ {
+     if (!w->isTopLevel() || shouldOmitFrameAdjustment(w->flags(), style))
+         return {};
++    if (hasFramelessNativeFrame(w->flags().testFlag(Qt::FramelessWindowHint), style))
++        return framelessMaximizedMargins(GetDpiForSystem());
+     RECT rect = {0,0,0,0};
+     style &= ~DWORD(WS_OVERLAPPED); // Not permitted, see docs.
+     if (AdjustWindowRectEx(&rect, style, FALSE, exStyle) == FALSE)
+@@ -1067,6 +1145,8 @@ QMargins QWindowsGeometryHint::frame(const QWindow *w, DWORD style, DWORD exStyl
+ {
+     if (!w->isTopLevel() || shouldOmitFrameAdjustment(w->flags(), style))
+         return {};
++    if (hasFramelessNativeFrame(w->flags().testFlag(Qt::FramelessWindowHint), style))
++        return framelessMaximizedMargins(unsigned(qRound(dpi)));
+     RECT rect = {0,0,0,0};
+     style &= ~DWORD(WS_OVERLAPPED); // Not permitted, see docs.
+     if (AdjustWindowRectExForDpi(&rect, style, FALSE, exStyle, unsigned(qRound(dpi))) == FALSE) {
+@@ -1121,8 +1201,21 @@ QMargins QWindowsGeometryHint::frame(const QWindow *w, const QRect &geometry,
+     return QWindowsGeometryHint::frame(w, style, exStyle, dpi);
+ }
+ 
+-bool QWindowsGeometryHint::handleCalculateSize(const QMargins &customMargins, const MSG &msg, LRESULT *result)
++bool QWindowsGeometryHint::handleCalculateSize(bool bFrameless, const QMargins &customMargins,
++                                               const MSG &msg, LRESULT *result)
+ {
++    const DWORD nStyle = DWORD(GetWindowLongPtr(msg.hwnd, GWL_STYLE));
++    if (hasFramelessNativeFrame(bFrameless, nStyle)) {
++        // 同时处理创建窗口时的 RECT 和调整窗口时的 NCCALCSIZE_PARAMS。
++        auto *pClientRect = msg.wParam
++                ? &reinterpret_cast<NCCALCSIZE_PARAMS *>(msg.lParam)->rgrc[0]
++                : reinterpret_cast<RECT *>(msg.lParam);
++        if (nStyle & WS_MAXIMIZE)
++            adjustFramelessMaximizedClientRect(msg.hwnd, pClientRect);
++        *result = 0;
++        return true;
++    }
++
+     // NCCALCSIZE_PARAMS structure if wParam==TRUE
+     if (!msg.wParam || customMargins.isNull())
+         return false;
+@@ -1176,6 +1269,15 @@ void QWindowsGeometryHint::applyToMinMaxInfo(const QWindow *w,
+         << " margins=" << margins
+         << " in " << *mmi;
+ 
++    const Qt::WindowType type = w->type();
++    if (w->isTopLevel() && w->flags().testFlag(Qt::FramelessWindowHint)
++            && (type == Qt::Window || type == Qt::Dialog || type == Qt::Sheet
++                || type == Qt::Tool || type == Qt::Drawer)) {
++        // 没有原生标题栏，不应继承 Windows 为标题文字和系统按钮预留的最小尺寸。
++        mmi->ptMinTrackSize.x = margins.left() + margins.right() + 1;
++        mmi->ptMinTrackSize.y = margins.top() + margins.bottom() + 1;
++    }
++
+     if (minimumSize.width() > 0)
+         mmi->ptMinTrackSize.x = minimumSize.width();
+     if (minimumSize.height() > 0)
+@@ -1967,6 +2069,8 @@ void QWindowsWindow::handleHidden()
+ 
+ void QWindowsWindow::handleCompositionSettingsChanged()
+ {
++    if (hasFramelessNativeFrame(isFrameless(), style()))
++        updateFramelessFrame(handle(), true);
+     const QWindow *w = window();
+     if ((w->surfaceType() == QWindow::OpenGLSurface
+          || w->surfaceType() == QWindow::VulkanSurface
+@@ -2089,6 +2193,9 @@ QRect QWindowsWindow::normalGeometry() const
+     const bool fakeFullScreen =
+         m_savedFrameGeometry.isValid() && (window()->windowStates() & Qt::WindowFullScreen);
+     const QRect frame = fakeFullScreen ? m_savedFrameGeometry : normalFrameGeometry(m_data.hwnd);
++    // 还原矩形属于普通状态，不能减去最大化状态下的不可见边框。
++    if (hasFramelessNativeFrame(isFrameless(), fakeFullScreen ? m_savedStyle : style()))
++        return frame;
+     const QMargins margins = fakeFullScreen
+         ? QWindowsGeometryHint::frame(window(), handle(), m_savedStyle, 0)
+         : fullFrameMargins();
+@@ -2183,6 +2290,7 @@ void QWindowsWindow::handleResized(int wParam, LPARAM lParam)
+     /* Prevents borderless windows from covering the taskbar when maximized. */
+     if ((m_data.flags.testFlag(Qt::FramelessWindowHint)
+          || (m_data.flags.testFlag(Qt::CustomizeWindowHint) && !m_data.flags.testFlag(Qt::WindowTitleHint)))
++        && !hasFramelessNativeFrame(isFrameless(), style())
+         && IsZoomed(m_data.hwnd)) {
+         const int resizedWidth = LOWORD(lParam);
+         const int resizedHeight = HIWORD(lParam);
+@@ -2426,10 +2534,13 @@ void QWindowsWindow::setWindowFlags(Qt::WindowFlags flags)
+     qCDebug(lcQpaWindow) << '>' << __FUNCTION__ << this << window() << "\n    from: "
+         << m_data.flags << "\n    to: " << flags;
+     const QRect oldGeometry = geometry();
++    const bool bHadFramelessFrame = hasFramelessNativeFrame(isFrameless(), style());
+     if (m_data.flags != flags) {
+         m_data.flags = flags;
+         if (m_data.hwnd) {
+             m_data = setWindowFlags_sys(flags);
++            if (bHadFramelessFrame && !hasFramelessNativeFrame(isFrameless(), style()))
++                updateFramelessFrame(handle(), false);
+             updateDropSite(window()->isTopLevel());
+         }
+     }
+@@ -2697,8 +2808,12 @@ void QWindowsWindow::setWindowState_sys(Qt::WindowStates newState)
+ void QWindowsWindow::setStyle(unsigned s) const
+ {
+     qCDebug(lcQpaWindow) << __FUNCTION__ << this << window() << debugWinStyle(s);
++    const bool bHadFramelessFrame = hasFramelessNativeFrame(isFrameless(), style());
+     setFlag(WithinSetStyle);
+     SetWindowLongPtr(m_data.hwnd, GWL_STYLE, s);
++    const bool bHasFramelessFrame = hasFramelessNativeFrame(isFrameless(), s);
++    if (bHadFramelessFrame || bHasFramelessFrame)
++        updateFramelessFrame(handle(), bHasFramelessFrame);
+     clearFlag(WithinSetStyle);
+ }
+ 
+@@ -2808,6 +2923,20 @@ void QWindowsWindow::calculateFullFrameMargins()
+     if (shouldOmitFrameAdjustment(m_data.flags, m_data.hwnd))
+         return;
+ 
++    if (hasFramelessNativeFrame(isFrameless(), style())) {
++        // 使用实际客户区边距，避免系统样式重新把已移除的标题栏高度算回来。
++        RECT rectWindow = {};
++        RECT rectClient = {};
++        if (GetWindowRect(handle(), &rectWindow) && GetClientRect(handle(), &rectClient)) {
++            MapWindowPoints(handle(), nullptr, reinterpret_cast<POINT *>(&rectClient), 2);
++            setFullFrameMargins(QMargins(rectClient.left - rectWindow.left,
++                                         rectClient.top - rectWindow.top,
++                                         rectWindow.right - rectClient.right,
++                                         rectWindow.bottom - rectClient.bottom));
++        }
++        return;
++    }
++
+     // QTBUG-113736: systemMargins depends on AdjustWindowRectExForDpi. This doesn't take into
+     // account possible external modifications to the titlebar, as with ExtendsContentIntoTitleBar()
+     // from the Windows App SDK. We can fix this by comparing the WindowRect (which includes the
+@@ -3098,6 +3227,39 @@ bool QWindowsWindow::handleNonClientHitTest(const QPoint &globalPos, LRESULT *re
+ {
+     // QTBUG-32663, suppress resize cursor for fixed size windows.
+     const QWindow *w = window();
++    if (hasFramelessNativeFrame(isFrameless(), style())) {
++        *result = HTCLIENT;
++        if (IsZoomed(handle()) || IsIconic(handle())
++                || (m_data.flags & Qt::MSWindowsFixedSizeDialogHint))
++            return true;
++
++        RECT rectWindow = {};
++        if (!GetWindowRect(handle(), &rectWindow))
++            return true;
++
++        // 使用 HWND 的物理坐标和 DPI，固定宽高分别关闭对应方向的缩放。
++        const UINT nDpi = GetDpiForWindow(handle());
++        const QMargins margins = framelessMaximizedMargins(nDpi);
++        const bool bResizeWidth = w->minimumWidth() < w->maximumWidth();
++        const bool bResizeHeight = w->minimumHeight() < w->maximumHeight();
++        const bool bLeft = bResizeWidth && globalPos.x() >= rectWindow.left
++                && globalPos.x() < rectWindow.left + margins.left();
++        const bool bRight = bResizeWidth && globalPos.x() < rectWindow.right
++                && globalPos.x() >= rectWindow.right - margins.right();
++        const bool bTop = bResizeHeight && globalPos.y() >= rectWindow.top
++                && globalPos.y() < rectWindow.top + margins.top();
++        const bool bBottom = bResizeHeight && globalPos.y() < rectWindow.bottom
++                && globalPos.y() >= rectWindow.bottom - margins.bottom();
++        if (bLeft)
++            *result = bTop ? HTTOPLEFT : (bBottom ? HTBOTTOMLEFT : HTLEFT);
++        else if (bRight)
++            *result = bTop ? HTTOPRIGHT : (bBottom ? HTBOTTOMRIGHT : HTRIGHT);
++        else if (bTop)
++            *result = HTTOP;
++        else if (bBottom)
++            *result = HTBOTTOM;
++        return true;
++    }
+     if (!w->isTopLevel() // Task 105852, minimized windows need to respond to user input.
+         || (m_windowState != Qt::WindowNoState)
+         || !isActive()
+diff --git a/qtbase/src/plugins/platforms/windows/qwindowswindow.h b/qtbase/src/plugins/platforms/windows/qwindowswindow.h
+index f2e5c7359205e8a49b7d34e31b34170ded8cb793..4dce290039697f81f85b16db0bdb56dce8434f2e 100644
+--- a/qtbase/src/plugins/platforms/windows/qwindowswindow.h
++++ b/qtbase/src/plugins/platforms/windows/qwindowswindow.h
+@@ -33,7 +33,8 @@ struct QWindowsGeometryHint
+     static QMargins frame(const QWindow *w, HWND hwnd);
+     static QMargins frame(const QWindow *w, const QRect &geometry,
+                           DWORD style, DWORD exStyle);
+-    static bool handleCalculateSize(const QMargins &customMargins, const MSG &msg, LRESULT *result);
++    static bool handleCalculateSize(bool bFrameless, const QMargins &customMargins,
++                                    const MSG &msg, LRESULT *result);
+     static void applyToMinMaxInfo(const QWindow *w, const QScreen *screen,
+                                   const QMargins &margins, MINMAXINFO *mmi);
+     static void applyToMinMaxInfo(const QWindow *w, const QMargins &margins,
